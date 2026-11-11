@@ -228,3 +228,7 @@ network cost of each operation instead of merely asserting the output. For an en
 check against a real bucket, run MinIO locally (`docker run -p 9100:9000 minio/minio server
 /data`) and watch requests with `mc admin trace --verbose`. Integration tests run against
 `object_store`'s in-memory backend; no credentials are needed.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
