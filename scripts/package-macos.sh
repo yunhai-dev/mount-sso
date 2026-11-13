@@ -31,13 +31,14 @@ fi
 rm -rf "$stage"
 mkdir -p "$stage"
 cp "$binary" "$stage/mount-sso"
-cp README.md LICENSE "$stage/"
+cp README.md README.zh-CN.md LICENSE "$stage/"
 chmod +x "$stage/mount-sso"
 
 echo "==> packaging"
 rm -f "$dist/$name.tar.gz" "$dist/$name.zip"
-tar -czf "$dist/$name.tar.gz" -C "$dist" "$name"
-(cd "$dist" && zip -qr "$name.zip" "$name")
+# Keep macOS extended-attribute sidecars (`._*`) out of the archives.
+COPYFILE_DISABLE=1 tar -czf "$dist/$name.tar.gz" -C "$dist" "$name"
+(cd "$dist" && zip -qXr "$name.zip" "$name")
 (cd "$dist" && shasum -a 256 "$name.tar.gz" "$name.zip" > SHA256SUMS)
 
 echo "==> done"

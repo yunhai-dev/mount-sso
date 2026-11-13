@@ -1,5 +1,7 @@
 # mount-sso
 
+English | [简体中文](README.zh-CN.md)
+
 Mount S3-compatible object storage as an ordinary directory on macOS.
 
 The tool serves the bucket over a loopback NFSv3 listener and asks `mount_nfs` to mount it,
