@@ -53,6 +53,34 @@ const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
 /// Maximum number of parts in flight for a multipart upload.
 const UPLOAD_CONCURRENCY: usize = 8;
 
+/// macOS bookkeeping that must never reach the bucket: hidden from listings and refused on
+/// create. The Finder drops `.DS_Store` into every directory it visits, Spotlight and Time
+/// Machine keep their own folders, and nothing in here is object data.
+const MACOS_JUNK_NAMES: &[&str] = &[
+    ".DS_Store",
+    ".Spotlight-V100",
+    ".Trashes",
+    ".fseventsd",
+    ".TemporaryItems",
+    ".DocumentRevisions-V100",
+    ".apdisk",
+    ".VolumeIcon.icns",
+    "Icon\r",
+];
+
+fn is_macos_junk(name: &str) -> bool {
+    MACOS_JUNK_NAMES.contains(&name)
+}
+
+/// AppleDouble siblings (`._name`) are how macOS stores extended attributes on filesystems
+/// without xattr support. They are hidden from listings and never uploaded, but they are
+/// writable: `cp -a`, `ditto` and the Finder write one next to every file whose attributes
+/// they want to preserve, and failing those writes breaks the copy. The bytes live in the
+/// staging file for the lifetime of the mount and evaporate with it.
+fn is_appledouble(name: &str) -> bool {
+    name.starts_with("._")
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     Dir,
@@ -86,6 +114,8 @@ struct State {
     pending_dirs: HashSet<String>,
     /// Inodes whose content is authoritative in the staging file.
     staged: HashSet<fileid3>,
+    /// AppleDouble scratch inodes: readable and writable, never uploaded.
+    local_only: HashSet<fileid3>,
 }
 
 impl State {
@@ -97,6 +127,7 @@ impl State {
             dirs: HashMap::new(),
             pending_dirs: HashSet::new(),
             staged: HashSet::new(),
+            local_only: HashSet::new(),
         };
         let now = now_secs();
         this.by_id.insert(
@@ -168,6 +199,7 @@ impl State {
             self.dirs.remove(&ino);
         }
         self.staged.remove(&ino);
+        self.local_only.remove(&ino);
     }
 
     /// Rewrite every registered path under `from` (as a directory) to start with `to`.
@@ -257,6 +289,9 @@ pub struct Config {
     pub read_cache_ttl: Duration,
     /// Objects up to this size are fetched whole on the first read; `0` disables it.
     pub prefetch_bytes: u64,
+    /// Hide macOS metadata (`.DS_Store`, `._*`, Spotlight/Time Machine folders) from the
+    /// mount and refuse to create it.
+    pub filter_macos_junk: bool,
 }
 
 impl Default for Config {
@@ -274,6 +309,7 @@ impl Default for Config {
             read_cache_bytes: 4 * 1024 * 1024 * 1024,
             read_cache_ttl: Duration::from_secs(30),
             prefetch_bytes: 256 * 1024 * 1024,
+            filter_macos_junk: true,
         }
     }
 }
@@ -415,6 +451,16 @@ impl Inner {
         ObjPath::from(self.abs(rel))
     }
 
+    /// True when `name` is macOS bookkeeping that this mount hides and refuses to create.
+    fn is_junk(&self, name: &str) -> bool {
+        self.cfg.filter_macos_junk && is_macos_junk(name)
+    }
+
+    /// True when `name` is an AppleDouble sibling: hidden, local-only, never uploaded.
+    fn is_appledouble(&self, name: &str) -> bool {
+        self.cfg.filter_macos_junk && is_appledouble(name)
+    }
+
     fn stage_path(&self, ino: fileid3) -> PathBuf {
         self.cfg.staging_dir.join(format!("{ino}.stage"))
     }
@@ -465,8 +511,14 @@ impl Inner {
             let Some(name) = full.strip_prefix(&head) else {
                 continue;
             };
-            // Skip the directory's own marker (`dir/`) and anything nested deeper.
-            if name.is_empty() || name.ends_with('/') || name.contains('/') {
+            // Skip the directory's own marker (`dir/`), anything nested deeper, and
+            // macOS bookkeeping.
+            if name.is_empty()
+                || name.ends_with('/')
+                || name.contains('/')
+                || self.is_junk(name)
+                || self.is_appledouble(name)
+            {
                 continue;
             }
             out.push(Child {
@@ -482,7 +534,7 @@ impl Inner {
                 continue;
             };
             let name = name.trim_end_matches('/');
-            if name.is_empty() || name.contains('/') {
+            if name.is_empty() || name.contains('/') || self.is_junk(name) || self.is_appledouble(name) {
                 continue;
             }
             out.push(Child {
@@ -782,8 +834,17 @@ impl Inner {
 
     /// Upload the staged content of `stage` if it is dirty.
     async fn flush_stage(&self, stage: Arc<Stage>) -> Result<()> {
+        let local_only = {
+            let state = self.state.lock().expect("state lock poisoned");
+            state.local_only.contains(&stage.ino)
+        };
         let (file, len) = {
             let mut meta = stage.meta.lock().expect("stage lock poisoned");
+            if local_only {
+                // AppleDouble scratch: dropped with the mount, never uploaded.
+                meta.dirty = false;
+                return Ok(());
+            }
             if !meta.dirty || meta.uploading {
                 return Ok(());
             }
@@ -1055,7 +1116,19 @@ impl NFSFileSystem for S3Fs {
         if name.is_empty() || name.contains('/') {
             return Err(nfsstat3::NFS3ERR_INVAL);
         }
+        if self.inner.is_junk(name) {
+            return Err(nfsstat3::NFS3ERR_NOENT);
+        }
         let rel = join_rel(&dir_rel, name);
+        if self.inner.is_appledouble(name) {
+            // Invisible unless this mount is the one that created it; objects of that shape
+            // left in the bucket stay hidden.
+            let known = {
+                let state = self.inner.state.lock().expect("state lock poisoned");
+                state.by_path.get(&rel).copied()
+            };
+            return known.ok_or(nfsstat3::NFS3ERR_NOENT);
+        }
 
         // Cheap path: the parent's cached listing already knows the name.
         let cached_hit = {
@@ -1091,15 +1164,15 @@ impl NFSFileSystem for S3Fs {
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         let mut entry = self.inner.entry(id)?;
-        let staged = {
-            self.inner
-                .state
-                .lock()
-                .expect("state lock poisoned")
-                .staged
-                .contains(&id)
+        let (staged, local_only) = {
+            let state = self.inner.state.lock().expect("state lock poisoned");
+            (state.staged.contains(&id), state.local_only.contains(&id))
         };
-        if entry.kind == Kind::File && !staged && entry.checked.elapsed() >= self.inner.cfg.dir_ttl {
+        if entry.kind == Kind::File
+            && !staged
+            && !local_only
+            && entry.checked.elapsed() >= self.inner.cfg.dir_ttl
+        {
             match self.inner.store.head(&self.inner.key(&entry.path)).await {
                 Ok(meta) => {
                     entry.size = meta.size;
@@ -1233,8 +1306,24 @@ impl NFSFileSystem for S3Fs {
             return Err(nfsstat3::NFS3ERR_ROFS);
         }
         let name = std::str::from_utf8(&filename.0).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+        if self.inner.is_junk(name) {
+            return Err(nfsstat3::NFS3ERR_ACCES);
+        }
+        let local_only = self.inner.is_appledouble(name);
         let dir_rel = self.inner.dir_path(dirid)?;
         let rel = join_rel(&dir_rel, name);
+
+        // AppleDouble siblings are scratch space: register the inode, publish nothing.
+        if local_only {
+            let ino = {
+                let mut state = self.inner.state.lock().expect("state lock poisoned");
+                let ino = state.intern(rel, Kind::File, 0, now_secs());
+                state.local_only.insert(ino);
+                ino
+            };
+            let entry = self.inner.entry(ino)?;
+            return Ok((ino, self.fattr(ino, &entry)));
+        }
 
         // UNCHECKED create on an existing file must not truncate: the client sends an
         // explicit SETATTR(size=0) when it wants O_TRUNC.
@@ -1275,8 +1364,21 @@ impl NFSFileSystem for S3Fs {
             return Err(nfsstat3::NFS3ERR_ROFS);
         }
         let name = std::str::from_utf8(&filename.0).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+        if self.inner.is_junk(name) {
+            return Err(nfsstat3::NFS3ERR_ACCES);
+        }
+        let local_only = self.inner.is_appledouble(name);
         let dir_rel = self.inner.dir_path(dirid)?;
         let rel = join_rel(&dir_rel, name);
+        if local_only {
+            let mut state = self.inner.state.lock().expect("state lock poisoned");
+            if state.by_path.contains_key(&rel) {
+                return Err(nfsstat3::NFS3ERR_EXIST);
+            }
+            let ino = state.intern(rel, Kind::File, 0, now_secs());
+            state.local_only.insert(ino);
+            return Ok(ino);
+        }
         let key = self.inner.key(&rel);
         let options = PutOptions {
             mode: PutMode::Create,
@@ -1311,6 +1413,9 @@ impl NFSFileSystem for S3Fs {
             return Err(nfsstat3::NFS3ERR_ROFS);
         }
         let name = std::str::from_utf8(&dirname.0).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+        if self.inner.is_junk(name) || self.inner.is_appledouble(name) {
+            return Err(nfsstat3::NFS3ERR_ACCES);
+        }
         let dir_rel = self.inner.dir_path(dirid)?;
         let rel = join_rel(&dir_rel, name);
         if !self.inner.listing_says_absent(dirid, name, &rel) {
@@ -1331,8 +1436,34 @@ impl NFSFileSystem for S3Fs {
             return Err(nfsstat3::NFS3ERR_ROFS);
         }
         let name = std::str::from_utf8(&filename.0).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+        if self.inner.is_junk(name) {
+            // Nothing of ours to delete; reporting success keeps `rm` quiet.
+            return Ok(());
+        }
         let dir_rel = self.inner.dir_path(dirid)?;
         let rel = join_rel(&dir_rel, name);
+        let local_only = {
+            let state = self.inner.state.lock().expect("state lock poisoned");
+            state
+                .by_path
+                .get(&rel)
+                .is_some_and(|ino| state.local_only.contains(ino))
+        };
+        if local_only {
+            let ino = {
+                let mut state = self.inner.state.lock().expect("state lock poisoned");
+                let ino = state.by_path.get(&rel).copied();
+                if let Some(ino) = ino {
+                    state.forget(ino);
+                }
+                ino
+            };
+            if let Some(ino) = ino {
+                self.inner.stages.lock().expect("stages lock poisoned").remove(&ino);
+                let _ = std::fs::remove_file(self.inner.stage_path(ino));
+            }
+            return Ok(());
+        }
         let (ino, entry) = self.inner.resolve_rel(&rel).await?;
 
         if entry.kind == Kind::Dir {
@@ -1383,11 +1514,36 @@ impl NFSFileSystem for S3Fs {
         }
         let from_name = std::str::from_utf8(&from_filename.0).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let to_name = std::str::from_utf8(&to_filename.0).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+        if self.inner.is_junk(from_name) || self.inner.is_junk(to_name) {
+            return Err(nfsstat3::NFS3ERR_ACCES);
+        }
+        let from_local = self.inner.is_appledouble(from_name);
+        let to_local = self.inner.is_appledouble(to_name);
+        if from_local != to_local {
+            // Moving a real object into (or out of) the AppleDouble namespace would either
+            // lose data or smuggle a never-uploaded file into the bucket.
+            return Err(nfsstat3::NFS3ERR_ACCES);
+        }
         let from_dir = self.inner.dir_path(from_dirid)?;
         let to_dir = self.inner.dir_path(to_dirid)?;
         let from_rel = join_rel(&from_dir, from_name);
         let to_rel = join_rel(&to_dir, to_name);
         if from_rel == to_rel {
+            return Ok(());
+        }
+        if from_local && to_local {
+            let mut state = self.inner.state.lock().expect("state lock poisoned");
+            let Some(ino) = state.by_path.remove(&from_rel) else {
+                return Err(nfsstat3::NFS3ERR_NOENT);
+            };
+            if let Some(displaced) = state.by_path.insert(to_rel.clone(), ino) {
+                state.forget(displaced);
+            }
+            if let Some(entry) = state.by_id.get_mut(&ino) {
+                entry.path = to_rel;
+            }
+            state.dirs.remove(&from_dirid);
+            state.dirs.remove(&to_dirid);
             return Ok(());
         }
         let (ino, entry) = self.inner.resolve_rel(&from_rel).await?;

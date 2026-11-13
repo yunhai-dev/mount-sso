@@ -168,6 +168,7 @@ async fn start_server() -> (u16, mpsc::Receiver<bool>, tokio::task::JoinHandle<(
         read_cache_bytes: 0,
         read_cache_ttl: Duration::ZERO,
         prefetch_bytes: 0,
+        filter_macos_junk: true,
     };
     let fs = S3Fs::new(store, cfg).await.unwrap();
     let mut listener = NFSTcpListener::bind("127.0.0.1:0", fs).await.unwrap();

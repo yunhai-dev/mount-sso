@@ -34,6 +34,7 @@ fn config(read_only: bool, root_prefix: &str, staging: std::path::PathBuf) -> Co
         read_cache_bytes: 0,
         read_cache_ttl: Duration::ZERO,
         prefetch_bytes: 0,
+        filter_macos_junk: true,
     }
 }
 

@@ -8,8 +8,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use mount_sso::vfs::{Config, S3Fs};
-use nfsserve::nfs::{filename3, sattr3};
+use nfsserve::nfs::{filename3, nfsstat3, sattr3};
 use nfsserve::vfs::NFSFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjPath;
@@ -128,6 +129,7 @@ async fn fixture(ttl: Duration) -> (S3Fs, Arc<Counts>, tempfile::TempDir, Arc<dy
             read_cache_bytes: 1024 * 1024,
             read_cache_ttl: Duration::from_secs(60),
             prefetch_bytes: 4096,
+            filter_macos_junk: true,
         },
     )
     .await
@@ -312,4 +314,139 @@ async fn concurrent_reads_of_one_object_share_a_single_fetch() {
 
     let after = counts.snapshot();
     assert_eq!(after[1].1 - before[1].1, 1, "one fetch serves every concurrent reader");
+}
+
+#[tokio::test]
+async fn macos_junk_is_hidden_and_never_uploaded() {
+    let (fs, counts, _dir, store) = fixture(Duration::from_secs(60)).await;
+    let seeded = ["keep.txt", ".DS_Store", "._keep.txt", ".Spotlight-V100/x", ".Trashes/y"];
+    for key in seeded {
+        store
+            .put(&ObjPath::from(key), PutPayload::from_static(b"junk"))
+            .await
+            .unwrap();
+    }
+    let root = fs.root_dir();
+
+    // Junk that already exists in the bucket is invisible.
+    let names: Vec<String> = fs
+        .readdir(root, 0, 64)
+        .await
+        .unwrap()
+        .entries
+        .iter()
+        .map(|entry| String::from_utf8(entry.name.0.clone()).unwrap())
+        .collect();
+    assert_eq!(names, ["keep.txt"]);
+    for hidden in [".DS_Store", "._keep.txt", ".Spotlight-V100", ".Trashes"] {
+        assert_eq!(
+            fs.lookup(root, &name(hidden)).await.unwrap_err() as u32,
+            nfsstat3::NFS3ERR_NOENT as u32,
+            "{hidden} must not resolve"
+        );
+    }
+
+    // Bookkeeping directories are refused outright, without touching the store.
+    let before = counts.snapshot();
+    for junk in [".DS_Store", ".fseventsd", ".Spotlight-V100"] {
+        assert_eq!(
+            fs.create(root, &name(junk), sattr3::default()).await.unwrap_err() as u32,
+            nfsstat3::NFS3ERR_ACCES as u32
+        );
+        assert_eq!(
+            fs.mkdir(root, &name(junk)).await.unwrap_err() as u32,
+            nfsstat3::NFS3ERR_ACCES as u32
+        );
+    }
+    assert_eq!(
+        fs.create_exclusive(root, &name(".DS_Store")).await.unwrap_err() as u32,
+        nfsstat3::NFS3ERR_ACCES as u32
+    );
+    assert_eq!(
+        fs.rename(root, &name("keep.txt"), root, &name(".DS_Store"))
+            .await
+            .unwrap_err() as u32,
+        nfsstat3::NFS3ERR_ACCES as u32
+    );
+    assert_eq!(counts.snapshot()[0].1, before[0].1, "no PUT for refused names");
+
+    // AppleDoubles are scratch space: writable, readable, but never uploaded.
+    let (ad, _) = fs.create(root, &name("._keep.txt2"), sattr3::default()).await.unwrap();
+    fs.write(ad, 0, b"attrs").await.unwrap();
+    assert_eq!(fs.read(ad, 0, 5).await.unwrap().0, b"attrs");
+    assert_eq!(fs.lookup(root, &name("._keep.txt2")).await.unwrap(), ad);
+    let mid = counts.snapshot();
+    assert_eq!(mid[0].1, before[0].1, "AppleDouble create/write must not PUT");
+    fs.remove(root, &name("._keep.txt2")).await.unwrap();
+    assert_eq!(
+        counts.snapshot()[5].1,
+        mid[5].1,
+        "AppleDouble remove must not delete from the store"
+    );
+
+    // Crossing the boundary is refused: a real file must not become a local-only one.
+    assert_eq!(
+        fs.rename(root, &name("keep.txt"), root, &name("._keep.txt"))
+            .await
+            .unwrap_err() as u32,
+        nfsstat3::NFS3ERR_ACCES as u32
+    );
+
+    // Ordinary names stay reachable, and shutdown uploads only them.
+    let (ino, _) = fs.create(root, &name("keep2.txt"), sattr3::default()).await.unwrap();
+    fs.write(ino, 0, b"data").await.unwrap();
+    fs.shutdown().await;
+    assert_eq!(fs.read(ino, 0, 4).await.unwrap().0, b"data");
+    let mut keys: Vec<String> = store
+        .list(None)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|item| item.unwrap().location.to_string())
+        .collect();
+    keys.sort();
+    let mut expected: Vec<String> = seeded.iter().map(|key| key.to_string()).collect();
+    expected.push("keep2.txt".to_string());
+    expected.sort();
+    assert_eq!(
+        keys, expected,
+        "only real files may be uploaded; no AppleDouble object may ever appear"
+    );
+}
+
+#[tokio::test]
+async fn macos_junk_can_be_exposed_on_request() {
+    let (fs, _counts, _dir, store) = fixture(Duration::from_secs(60)).await;
+    store
+        .put(&ObjPath::from(".DS_Store"), PutPayload::from_static(b"junk"))
+        .await
+        .unwrap();
+    // The fixture filters by default; exercise the opt-out through a second filesystem that
+    // shares the same store and staging area.
+    let root = fs.root_dir();
+    assert_eq!(
+        fs.lookup(root, &name(".DS_Store")).await.unwrap_err() as u32,
+        nfsstat3::NFS3ERR_NOENT as u32
+    );
+
+    let staging = tempfile::tempdir().unwrap();
+    let config = Config {
+        filter_macos_junk: false,
+        dir_ttl: Duration::from_secs(60),
+        read_cache_bytes: 0,
+        prefetch_bytes: 0,
+        staging_dir: staging.path().join("staging"),
+        cache_dir: staging.path().join("read"),
+        ..Config::default()
+    };
+    let unfiltered = S3Fs::new(store, config).await.unwrap();
+    let visible: Vec<String> = unfiltered
+        .readdir(unfiltered.root_dir(), 0, 64)
+        .await
+        .unwrap()
+        .entries
+        .iter()
+        .map(|entry| String::from_utf8(entry.name.0.clone()).unwrap())
+        .collect();
+    assert_eq!(visible, [".DS_Store"]);
 }

@@ -90,6 +90,7 @@ for the region is used.
 | `--read-cache-ms <MS>` | `30000` | How long a fetched object is served from the local copy; `0` disables the read cache |
 | `--read-cache-mib <MIB>` | `4096` | Cap on cached object bytes; `0` disables the read cache |
 | `--prefetch-mib <MIB>` | `256` | Objects up to this size are fetched whole on first read; `0` streams instead |
+| `--keep-macos-junk` | off | Expose macOS bookkeeping files and upload AppleDoubles instead of hiding them |
 | `-v`, `-vv` | – | Debug / trace logging to stderr; `MOUNT_SSO_LOG` overrides the filter |
 
 ## How the bucket becomes a file tree
@@ -102,6 +103,18 @@ for the region is used.
   mount (it disappears on unmount or process restart if it stayed empty).
 - **Inodes are per session.** `fileid3`s are allocated per path on demand and cached
   together with listings; reading a stale inode returns `NFS3ERR_STALE`.
+- **macOS metadata is excluded.** `.DS_Store`, `.Spotlight-V100`, `.Trashes`, `.fseventsd`,
+  `.TemporaryItems`, `.DocumentRevisions-V100`, `.apdisk`, `.VolumeIcon.icns` and `Icon\r`
+  are hidden from listings and lookups and refused on `create`/`mkdir` with `EACCES`
+  (permission denied), even when the bucket already contains them.
+- **AppleDouble files stay local.** `._name` siblings are macOS' way of storing extended
+  attributes on filesystems without xattr support; `cp -a`, `ditto` and the Finder write one
+  next to anything whose attributes they preserve. They are writable and readable for the
+  duration of the mount, hidden from listings, and never uploaded — the bytes live in the
+  staging file and evaporate on unmount. Refusing them instead would break attribute-
+  preserving copies, so they are sunk rather than rejected. Moving a real file into that
+  namespace (or out of it) is refused with `EACCES`. `--keep-macos-junk` disables the whole
+  filter.
 - **Attributes.** Files are `0644`, directories `0755`, both owned by the invoking user
   (the daemon runs unprivileged; only `mount_nfs` is elevated). Size and mtime come from
   the object; `chmod` and `utimes` are accepted and kept in memory for the session — S3 has
@@ -163,10 +176,10 @@ default read cache) while driving the mounted tree:
 | `rm` a file | 1 × delete |
 | `mv` a file | 1 × `CopyObject` + 1 × delete of the source (after flushing it) |
 
-Two costs are inherent to the client rather than the server: macOS stores extended
-attributes for new files, which appears as an additional `._name` object per file, and each
-`open` is preceded by a `LOOKUP`, which costs one probe when the name is not in a warm
-listing.
+One cost is inherent to the client rather than the server: every `open` is preceded by a
+`LOOKUP`, which costs one probe when the name is not in a warm listing. AppleDouble
+`._name` siblings that macOS writes next to files with extended attributes stay in the
+local staging area, so they cost no request and no object.
 
 ## Limits and semantics
 
@@ -194,7 +207,9 @@ listing.
 | Command hangs after a crash | Stale NFS mount: `umount -f <dir>`, then remount. |
 | Too many requests | Raise `--dir-cache-ms`, `--read-cache-ms` and `--prefetch-mib`; prefer one large sequential read over many small random ones when the objects are huge. |
 | Local disk fills up | Lower `--max-stage-mib` / `--read-cache-mib`, or point `--cache-dir` at a larger volume. |
-| New files appear as `._name` | macOS extended attributes, one extra object per file; harmless, delete them if the bucket is consumed elsewhere. |
+| `touch .DS_Store` fails with EACCES | Expected: bookkeeping names are refused so metadata stays out of the bucket. |
+| `cp -a` warns about attributes | Expected: NFSv3 has no xattrs, so macOS falls back to a local-only `._name` sibling; the copy still succeeds. |
+| Junk already in the bucket | It is hidden by the filter; delete it through the bucket itself (S3 console, `mc`, `aws s3 rm`). |
 
 ## Architecture
 

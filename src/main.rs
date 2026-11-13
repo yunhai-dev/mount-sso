@@ -92,6 +92,10 @@ struct MountArgs {
     /// Objects up to this size are fetched whole on first read, in MiB (`0` streams instead).
     #[arg(long, default_value_t = 256)]
     prefetch_mib: u64,
+    /// Also expose macOS bookkeeping files (`.DS_Store`, `._*`, Spotlight folders) instead
+    /// of hiding them and refusing to create them.
+    #[arg(long)]
+    keep_macos_junk: bool,
     /// Increase log verbosity.
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -180,6 +184,7 @@ async fn run_mount(args: MountArgs) -> Result<()> {
             Duration::from_millis(args.read_cache_ms.max(100))
         },
         prefetch_bytes: args.prefetch_mib.saturating_mul(1024 * 1024),
+        filter_macos_junk: !args.keep_macos_junk,
     };
     let fs = S3Fs::new(store, config).await?;
 
