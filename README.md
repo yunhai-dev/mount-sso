@@ -42,9 +42,9 @@ the only privileged step is the `mount_nfs` call itself, which the tool wraps in
 Prebuilt binary (Apple silicon, macOS 11+):
 
 ```console
-$ curl -LO https://github.com/yunhai-dev/mount-sso/releases/download/v0.1.0/mount-sso-0.1.0-aarch64-apple-darwin.tar.gz
-$ tar -xzf mount-sso-0.1.0-aarch64-apple-darwin.tar.gz
-$ sudo install mount-sso-0.1.0-aarch64-apple-darwin/mount-sso /usr/local/bin/
+$ curl -LO https://github.com/yunhai-dev/mount-sso/releases/download/v0.1.1/mount-sso-0.1.1-aarch64-apple-darwin.tar.gz
+$ tar -xzf mount-sso-0.1.1-aarch64-apple-darwin.tar.gz
+$ sudo install mount-sso-0.1.1-aarch64-apple-darwin/mount-sso /usr/local/bin/
 ```
 
 The release also publishes `SHA256SUMS`; verify with `shasum -a 256 -c SHA256SUMS`.

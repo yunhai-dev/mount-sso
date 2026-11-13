@@ -462,3 +462,70 @@ async fn deleted_objects_report_noent_after_the_cache_expires() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(err_code(fs.getattr(ino).await.unwrap_err()), nfsstat3::NFS3ERR_NOENT as u32);
 }
+
+#[tokio::test]
+async fn unicode_and_reserved_names_round_trip() {
+    let f = fixture(false).await;
+    // Seed literal keys the way a real bucket stores them; `Path::from` would pre-encode
+    // them and hide them from every request.
+    for key in [
+        "名字/子目录/文件.txt",
+        "weird/hash#1.txt",
+        "weird/pct%3.txt",
+        "weird/with space.txt",
+    ] {
+        f.store
+            .put(&ObjPath::parse(key).unwrap(), PutPayload::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+    let root = f.fs.root_dir();
+    assert_eq!(read_names(&f.fs, root).await, ["weird", "名字"]);
+
+    let dir = f.fs.lookup(root, &name("名字")).await.unwrap();
+    assert_eq!(read_names(&f.fs, dir).await, ["子目录"]);
+    let sub = f.fs.lookup(dir, &name("子目录")).await.unwrap();
+    let file = f.fs.lookup(sub, &name("文件.txt")).await.unwrap();
+    assert_eq!(f.fs.read(file, 0, 4).await.unwrap().0, b"x");
+
+    let weird = f.fs.lookup(root, &name("weird")).await.unwrap();
+    assert_eq!(
+        read_names(&f.fs, weird).await,
+        ["hash#1.txt", "pct%3.txt", "with space.txt"]
+    );
+    let hash = f.fs.lookup(weird, &name("hash#1.txt")).await.unwrap();
+    assert_eq!(f.fs.read(hash, 0, 4).await.unwrap().0, b"x");
+
+    // Writing through the mount must produce the literal key.
+    let (ino, _) = f
+        .fs
+        .create(root, &name("新建 文件.txt"), sattr3::default())
+        .await
+        .unwrap();
+    f.fs.write(ino, 0, b"hi").await.unwrap();
+    f.fs.shutdown().await;
+    let stored = f
+        .store
+        .get(&ObjPath::parse("新建 文件.txt").unwrap())
+        .await
+        .expect("object stored under its literal key");
+    assert_eq!(stored.bytes().await.unwrap().as_ref(), b"hi");
+}
+
+#[tokio::test]
+async fn a_shared_name_prefix_is_not_a_directory() {
+    let f = fixture(false).await;
+    f.store
+        .put(&ObjPath::from("x/yz.txt"), PutPayload::from_static(b"only"))
+        .await
+        .unwrap();
+    let root = f.fs.root_dir();
+    let dir = f.fs.lookup(root, &name("x")).await.unwrap();
+
+    assert_eq!(
+        err_code(f.fs.lookup(dir, &name("y")).await.unwrap_err()),
+        nfsstat3::NFS3ERR_NOENT as u32,
+        "`x/y` must not exist just because `x/yz.txt` does"
+    );
+    assert!(f.fs.lookup(dir, &name("yz.txt")).await.is_ok());
+}

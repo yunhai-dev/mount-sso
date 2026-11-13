@@ -339,6 +339,16 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Builds a request path from a *literal* object key.
+///
+/// `Path::from` percent-encodes its input, and the S3 client encodes the path again when it
+/// signs the request, so keys containing non-ASCII text (or `%`, `#`, `?`, `*`, `[`, ...)
+/// would be requested double-encoded and never found. `Path::parse` keeps the literal key
+/// and lets the client encode it exactly once.
+fn obj_path(key: &str) -> ObjPath {
+    ObjPath::parse(key).unwrap_or_else(|_| ObjPath::from(key))
+}
+
 fn join_rel(dir: &str, name: &str) -> String {
     if dir.is_empty() {
         name.to_string()
@@ -448,7 +458,7 @@ impl Inner {
     }
 
     fn key(&self, rel: &str) -> ObjPath {
-        ObjPath::from(self.abs(rel))
+        obj_path(&self.abs(rel))
     }
 
     /// True when `name` is macOS bookkeeping that this mount hides and refuses to create.
@@ -493,7 +503,7 @@ impl Inner {
         let prefix = if base.is_empty() {
             None
         } else {
-            Some(ObjPath::from(base.clone()))
+            Some(obj_path(&base))
         };
         let listing = self
             .store
@@ -623,10 +633,19 @@ impl Inner {
             return Ok(Some((Kind::Dir, DIR_SIZE, 0)));
         }
         // A directory exists iff something is stored below it (or a `rel/` marker does).
-        let prefix = ObjPath::from(format!("{}/", self.abs(rel)));
+        // `Path` cannot carry a trailing delimiter, so the listed prefix is also matched by
+        // names that merely start with it (`a/b` vs `a/bc`); the first key decides.
+        let want = format!("{}/", self.abs(rel));
+        let prefix = obj_path(&want);
         let mut stream = self.store.list(Some(&prefix));
         match stream.next().await {
-            Some(Ok(_)) => Ok(Some((Kind::Dir, DIR_SIZE, 0))),
+            Some(Ok(meta)) => {
+                if meta.location.as_ref().starts_with(&want) {
+                    Ok(Some((Kind::Dir, DIR_SIZE, 0)))
+                } else {
+                    Ok(None)
+                }
+            }
             Some(Err(err)) => Err(nfs_err(err)),
             None => Ok(None),
         }
@@ -1596,7 +1615,7 @@ impl NFSFileSystem for S3Fs {
             let from_prefix = format!("{}/", self.inner.abs(&from_rel));
             let to_prefix = format!("{}/", self.inner.abs(&to_rel));
             let mut keys: Vec<ObjPath> = Vec::new();
-            let mut stream = self.inner.store.list(Some(&ObjPath::from(from_prefix.clone())));
+            let mut stream = self.inner.store.list(Some(&obj_path(&from_prefix)));
             while let Some(item) = stream.next().await {
                 keys.push(item.map_err(nfs_err)?.location);
             }
@@ -1607,7 +1626,7 @@ impl NFSFileSystem for S3Fs {
                 let Some(suffix) = raw.strip_prefix(&from_prefix) else {
                     continue;
                 };
-                let target = ObjPath::from(format!("{to_prefix}{suffix}"));
+                let target = obj_path(&format!("{to_prefix}{suffix}"));
                 self.inner.store.copy(key, &target).await.map_err(nfs_err)?;
             }
             for key in &keys {
@@ -1688,5 +1707,26 @@ impl NFSFileSystem for S3Fs {
             // No hard links and no symlinks: say so, so clients do not try.
             properties: FSF_HOMOGENEOUS | FSF_CANSETTIME,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_paths_keep_literal_keys() {
+        // `Path::from` would store `%E5%90%8D...`, which the S3 client then encodes again.
+        for key in [
+            "名字/子目录/文件.txt",
+            "reports/2024 q3#1.pdf",
+            "a%b/c?d.txt",
+            "a/with space.txt",
+            "plain/ascii.txt",
+        ] {
+            let path = obj_path(key);
+            assert_eq!(path.as_ref(), key, "{key} must stay literal, not pre-encoded");
+        }
+        assert_eq!(obj_path("").as_ref(), "");
     }
 }
