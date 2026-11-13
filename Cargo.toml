@@ -1,6 +1,6 @@
 [package]
 name = "mount-sso"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Mount S3-compatible object storage as a macOS directory over a loopback NFSv3 server"
 license = "MIT"

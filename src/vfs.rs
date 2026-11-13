@@ -493,8 +493,25 @@ impl Inner {
         Ok(entry.path)
     }
 
-    fn invalidate_dir(&self, ino: fileid3) {
-        self.state.lock().expect("state lock poisoned").dirs.remove(&ino);
+    /// Applies a local mutation to a cached listing instead of dropping it.
+    ///
+    /// Invalidating on every `create` would force the next lookup and create to probe the
+    /// store, which costs two extra round trips per file during a bulk copy. The listing is
+    /// updated in place and its age reset, keeping it authoritative for local changes.
+    fn splice_dir_entry(&self, dir_ino: fileid3, remove: Option<&str>, add: Option<(&str, fileid3)>) {
+        let mut state = self.state.lock().expect("state lock poisoned");
+        let Some(listing) = state.dirs.get_mut(&dir_ino) else {
+            return;
+        };
+        if let Some(name) = remove {
+            listing.entries.retain(|(entry, _)| entry != name);
+        }
+        if let Some((name, ino)) = add {
+            listing.entries.retain(|(entry, _)| entry != name);
+            listing.entries.push((name.to_string(), ino));
+            listing.entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        }
+        listing.fetched = Instant::now();
     }
 
     /// Fetch the direct children of `rel` from S3.
@@ -1162,6 +1179,9 @@ impl NFSFileSystem for S3Fs {
         if let Some(ino) = cached_hit {
             return Ok(ino);
         }
+        if self.inner.listing_says_absent(dirid, name, &rel) {
+            return Err(nfsstat3::NFS3ERR_NOENT);
+        }
 
         let (ino, entry) = self.inner.resolve_rel(&rel).await?;
         // Keep any cached listing consistent with the freshly resolved name.
@@ -1352,7 +1372,7 @@ impl NFSFileSystem for S3Fs {
             self.inner.resolve_rel(&rel).await.ok()
         };
         if let Some((ino, entry)) = existing {
-            self.inner.invalidate_dir(dirid);
+            self.inner.splice_dir_entry(dirid, None, Some((name, ino)));
             return Ok((ino, self.fattr(ino, &entry)));
         }
 
@@ -1373,7 +1393,7 @@ impl NFSFileSystem for S3Fs {
             }
             ino
         };
-        self.inner.invalidate_dir(dirid);
+        self.inner.splice_dir_entry(dirid, None, Some((name, ino)));
         let entry = self.inner.entry(ino)?;
         Ok((ino, self.fattr(ino, &entry)))
     }
@@ -1423,7 +1443,7 @@ impl NFSFileSystem for S3Fs {
             let mut state = self.inner.state.lock().expect("state lock poisoned");
             state.intern(rel, Kind::File, 0, now_secs())
         };
-        self.inner.invalidate_dir(dirid);
+        self.inner.splice_dir_entry(dirid, None, Some((name, ino)));
         Ok(ino)
     }
 
@@ -1445,7 +1465,7 @@ impl NFSFileSystem for S3Fs {
             state.pending_dirs.insert(rel.clone());
             state.intern(rel, Kind::Dir, DIR_SIZE, now_secs())
         };
-        self.inner.invalidate_dir(dirid);
+        self.inner.splice_dir_entry(dirid, None, Some((name, ino)));
         let entry = self.inner.entry(ino)?;
         Ok((ino, self.fattr(ino, &entry)))
     }
@@ -1517,7 +1537,7 @@ impl NFSFileSystem for S3Fs {
                 .expect("state lock poisoned")
                 .forget(ino);
         }
-        self.inner.invalidate_dir(dirid);
+        self.inner.splice_dir_entry(dirid, Some(name), None);
         Ok(())
     }
 
@@ -1635,8 +1655,8 @@ impl NFSFileSystem for S3Fs {
             let mut state = self.inner.state.lock().expect("state lock poisoned");
             state.rewrite_paths(&from_rel, &to_rel);
         }
-        self.inner.invalidate_dir(from_dirid);
-        self.inner.invalidate_dir(to_dirid);
+        self.inner.splice_dir_entry(from_dirid, Some(from_name), None);
+        self.inner.splice_dir_entry(to_dirid, Some(to_name), Some((to_name, ino)));
         Ok(())
     }
 

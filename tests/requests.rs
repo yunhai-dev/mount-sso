@@ -183,6 +183,30 @@ async fn create_in_a_warmed_directory_uploads_once_without_probing() {
 }
 
 #[tokio::test]
+async fn sequential_creates_keep_the_parent_listing_warm() {
+    let (fs, counts, _dir, _store) = fixture(Duration::from_secs(60)).await;
+    let root = fs.root_dir();
+    fs.readdir(root, 0, 64).await.unwrap(); // warm the listing
+    let before = counts.snapshot();
+
+    for index in 0..20 {
+        fs.create(root, &name(&format!("bulk{index}.txt")), sattr3::default())
+            .await
+            .unwrap();
+    }
+    // Created names are visible without a round trip, and none of the creates probed.
+    for index in 0..20 {
+        fs.lookup(root, &name(&format!("bulk{index}.txt"))).await.unwrap();
+    }
+
+    let after = counts.snapshot();
+    assert_eq!(after[0].1 - before[0].1, 20, "one empty object per create");
+    assert_eq!(after[1].1, before[1].1, "no reads or heads for bulk creates");
+    assert_eq!(after[2].1, before[2].1, "no re-listing for bulk creates");
+    assert_eq!(after[3].1, before[3].1, "no prefix probes for bulk creates");
+}
+
+#[tokio::test]
 async fn reads_are_ranged_and_served_from_staging_after_write() {
     let (fs, counts, _dir, _store) = fixture(Duration::from_secs(60)).await;
     let root = fs.root_dir();
@@ -212,16 +236,37 @@ async fn fs_dir_put(fs: &S3Fs, key: &str) {
 }
 
 #[tokio::test]
-async fn unmounted_state_reports_noent_without_extra_requests() {
-    let (fs, counts, _dir, _store) = fixture(Duration::from_secs(60)).await;
+async fn misses_against_a_warm_listing_are_answered_locally() {
+    let (fs, counts, _dir, store) = fixture(Duration::from_secs(60)).await;
+    store
+        .put(&ObjPath::from("present.txt"), PutPayload::from_static(b"x"))
+        .await
+        .unwrap();
     let root = fs.root_dir();
     fs.readdir(root, 0, 64).await.unwrap();
     let before = counts.snapshot();
+
     let err = fs.lookup(root, &name("missing.txt")).await.unwrap_err();
-    assert_eq!(err as u32, nfsserve::nfs::nfsstat3::NFS3ERR_NOENT as u32);
-    // A miss against a warm listing still has to ask the store once (head + prefix list).
-    let after = counts.snapshot();
-    assert!(after[1].1 > before[1].1);
+    assert_eq!(err as u32, nfsstat3::NFS3ERR_NOENT as u32);
+    assert_eq!(
+        counts.snapshot()[1].1,
+        before[1].1,
+        "a name absent from a fresh listing needs no probe"
+    );
+
+    // Once the listing ages out, the same lookup goes to the store again.
+    let stale = fixture(Duration::from_millis(1)).await;
+    stale.0.readdir(stale.0.root_dir(), 0, 64).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let before = stale.1.snapshot();
+    assert_eq!(
+        stale.0.lookup(stale.0.root_dir(), &name("gone.txt")).await.unwrap_err() as u32,
+        nfsstat3::NFS3ERR_NOENT as u32
+    );
+    assert!(
+        stale.1.snapshot()[1].1 > before[1].1,
+        "an expired listing must be re-checked against the store"
+    );
 }
 
 #[tokio::test]

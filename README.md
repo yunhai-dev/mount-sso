@@ -42,9 +42,9 @@ the only privileged step is the `mount_nfs` call itself, which the tool wraps in
 Prebuilt binary (Apple silicon, macOS 11+):
 
 ```console
-$ curl -LO https://github.com/yunhai-dev/mount-sso/releases/download/v0.1.1/mount-sso-0.1.1-aarch64-apple-darwin.tar.gz
-$ tar -xzf mount-sso-0.1.1-aarch64-apple-darwin.tar.gz
-$ sudo install mount-sso-0.1.1-aarch64-apple-darwin/mount-sso /usr/local/bin/
+$ curl -LO https://github.com/yunhai-dev/mount-sso/releases/download/v0.1.2/mount-sso-0.1.2-aarch64-apple-darwin.tar.gz
+$ tar -xzf mount-sso-0.1.2-aarch64-apple-darwin.tar.gz
+$ sudo install mount-sso-0.1.2-aarch64-apple-darwin/mount-sso /usr/local/bin/
 ```
 
 The release also publishes `SHA256SUMS`; verify with `shasum -a 256 -c SHA256SUMS`.
@@ -195,6 +195,24 @@ default read cache) while driving the mounted tree:
 | `rmdir` | listings only (emptiness check); a directory is never a stored object |
 | `rm` a file | 1 × delete |
 | `mv` a file | 1 × `CopyObject` + 1 × delete of the source (after flushing it) |
+
+### Bulk copies
+
+`cp` walks its arguments one at a time — that is the tool, not the mount: each file costs a
+`LOOKUP`, a `CREATE` and a `WRITE`, and only `CREATE` blocks on the network (one
+empty-object `PUT`). File contents are staged and uploaded in parallel after `--flush-ms`.
+Local mutations update the cached listing in place instead of dropping it, so the lookups
+and creates of a run stay off the network.
+
+200 small files against a local MinIO, release build:
+
+| How | Wall time | S3 requests |
+| --- | --- | --- |
+| `cp -R src/. dst/` | 2.1 s | 400 × `PUT` + 4 probes |
+| `ls \| xargs -P8 -n 25 cp` | 1.0 s | 400 × `PUT` + 18 probes |
+
+The two `PUT`s per file are the empty object that makes the name visible and the content
+flush; parallelising the copy is the lever for bulk transfers.
 
 One cost is inherent to the client rather than the server: every `open` is preceded by a
 `LOOKUP`, which costs one probe when the name is not in a warm listing. AppleDouble
