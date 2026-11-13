@@ -39,9 +39,29 @@ the only privileged step is the `mount_nfs` call itself, which the tool wraps in
 
 ## Install
 
+Prebuilt binary (Apple silicon, macOS 11+):
+
+```console
+$ curl -LO https://github.com/yunhai-dev/mount-sso/releases/download/v0.1.0/mount-sso-0.1.0-aarch64-apple-darwin.tar.gz
+$ tar -xzf mount-sso-0.1.0-aarch64-apple-darwin.tar.gz
+$ sudo install mount-sso-0.1.0-aarch64-apple-darwin/mount-sso /usr/local/bin/
+```
+
+The release also publishes `SHA256SUMS`; verify with `shasum -a 256 -c SHA256SUMS`.
+The binary is not notarized, so a download through a browser picks up the quarantine
+attribute and Gatekeeper refuses the first run — `xattr -d com.apple.quarantine mount-sso`
+(or installing through `curl`/Homebrew, which do not set it) resolves that.
+
+From source:
+
 ```console
 $ cargo install --path .
+$ ./scripts/package-macos.sh    # tarball, zip and SHA256SUMS in dist/
 ```
+
+Only `aarch64-apple-darwin` is built here; for a universal binary install both targets
+(`rustup target add x86_64-apple-darwin`) and merge with
+`lipo -create -output mount-sso target/{aarch64,x86_64}-apple-darwin/release/mount-sso`.
 
 ## Usage
 
