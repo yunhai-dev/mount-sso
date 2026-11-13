@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use mount_sso::daemon::StateFile;
 use mount_sso::vfs::S3Fs;
 use mount_sso::{backend, mount, vfs};
 
@@ -208,6 +209,10 @@ async fn run_mount(args: MountArgs) -> Result<()> {
         .await
         .context("joining the mount task")??;
 
+    let state = StateFile::new(&mount_point);
+    if let Err(err) = state.publish_pid() {
+        warn!("could not publish the mount state file: {err:#}");
+    }
     println!(
         "mounted s3://{}{} at {} (loopback NFSv3 on 127.0.0.1:{port}{})",
         bucket,
@@ -253,8 +258,13 @@ async fn run_mount(args: MountArgs) -> Result<()> {
         }
     }
 
-    // Upload anything still staged before the mount goes away.
-    fs.shutdown().await;
+    // Upload anything still staged before the mount goes away. The result is published for
+    // `mount-sso umount` and reported here, so a silent data loss is impossible.
+    let report = fs.shutdown().await;
+    if let Err(err) = state.publish_result(&report) {
+        warn!("could not publish the flush result: {err:#}");
+    }
+    println!("{}", describe_flush(&report));
     let mount_point_for_umount = mount_point.clone();
     let unmounted = tokio::task::spawn_blocking(move || mount::unmount(&mount_point_for_umount))
         .await
@@ -268,13 +278,34 @@ async fn run_mount(args: MountArgs) -> Result<()> {
     if owned_cache_root {
         let _ = std::fs::remove_dir_all(&cache_root);
     }
-    Ok(())
+    if report.failures.is_empty() {
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
+}
+
+/// Human-readable summary of the final flush.
+fn describe_flush(report: &mount_sso::vfs::FlushReport) -> String {
+    if !report.failures.is_empty() {
+        let mut text = format!("sync incomplete: {} file(s) not uploaded", report.failures.len());
+        for (path, err) in &report.failures {
+            text.push_str(&format!("\n  {path}: {err}"));
+        }
+        return text;
+    }
+    match report.uploaded {
+        0 => "nothing left to sync".to_string(),
+        1 => "sync complete: 1 file uploaded".to_string(),
+        n => format!("sync complete: {n} files uploaded"),
+    }
 }
 
 async fn run_umount(mount_point: PathBuf) -> Result<()> {
     let mount_point = mount_point
         .canonicalize()
         .with_context(|| format!("resolving {}", mount_point.display()))?;
+    let state = StateFile::new(&mount_point);
     let target = mount_point.clone();
     let unmounted = tokio::task::spawn_blocking(move || mount::unmount(&target))
         .await
@@ -284,7 +315,34 @@ async fn run_umount(mount_point: PathBuf) -> Result<()> {
     } else {
         println!("{} is not mounted", mount_point.display());
     }
-    Ok(())
+
+    // The daemon flushes what is still staged *after* the unmount, so wait for it before
+    // claiming anything about the result.
+    if state.read().pid.is_none() {
+        return Ok(());
+    }
+    let finished = tokio::task::spawn_blocking({
+        let state = StateFile::new(&mount_point);
+        move || state.wait_for_daemon(Duration::from_secs(600))
+    })
+    .await
+    .context("joining the wait task")?;
+    if !finished {
+        bail!("the mount daemon did not exit within 10 minutes; staged uploads may still be running");
+    }
+    let record = state.read();
+    state.remove();
+    match record.result {
+        Some(report) if report.failures.is_empty() => {
+            println!("{}", describe_flush(&report));
+            Ok(())
+        }
+        Some(report) => {
+            println!("{}", describe_flush(&report));
+            std::process::exit(1);
+        }
+        None => bail!("the daemon exited without reporting a flush result; staged uploads may have been lost (was it killed?)"),
+    }
 }
 
 /// Splits `bucket` / `s3://bucket/prefix` into a bucket name and a normalised key prefix.

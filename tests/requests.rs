@@ -495,3 +495,113 @@ async fn macos_junk_can_be_exposed_on_request() {
         .collect();
     assert_eq!(visible, [".DS_Store"]);
 }
+
+#[tokio::test]
+async fn shutdown_reports_what_it_uploaded() {
+    let (fs, _counts, _dir, store) = fixture(Duration::from_secs(60)).await;
+    let root = fs.root_dir();
+    for file in ["one.txt", "two.txt"] {
+        let (ino, _) = fs.create(root, &name(file), sattr3::default()).await.unwrap();
+        fs.write(ino, 0, b"payload").await.unwrap();
+    }
+    let report = fs.shutdown().await;
+    assert_eq!(report.uploaded, 2);
+    assert!(report.failures.is_empty());
+    for file in ["one.txt", "two.txt"] {
+        assert_eq!(
+            store.get(&ObjPath::from(file)).await.unwrap().bytes().await.unwrap().as_ref(),
+            b"payload"
+        );
+    }
+    // A second shutdown has nothing left to do.
+    assert_eq!(fs.shutdown().await.uploaded, 0);
+}
+
+/// Store that delegates to the in-memory store but fails every PUT carrying data, so a
+/// file can be created (empty object) yet never have its content uploaded.
+#[derive(Debug)]
+struct FailingContentStore {
+    inner: Arc<dyn ObjectStore>,
+}
+
+impl std::fmt::Display for FailingContentStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failing-content({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FailingContentStore {
+    async fn put_opts(&self, location: &ObjPath, payload: PutPayload, opts: PutOptions) -> StoreResult<PutResult> {
+        if payload.content_length() > 0 {
+            return Err(object_store::Error::Generic {
+                store: "test",
+                source: format!("refusing to write {location}").into(),
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjPath,
+        opts: PutMultipartOptions,
+    ) -> StoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &ObjPath, options: GetOptions) -> StoreResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> StoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &ObjPath, to: &ObjPath, options: CopyOptions) -> StoreResult<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, StoreResult<ObjPath>>,
+    ) -> BoxStream<'static, StoreResult<ObjPath>> {
+        self.inner.delete_stream(locations)
+    }
+}
+
+#[tokio::test]
+async fn shutdown_surfaces_upload_failures_instead_of_swallowing_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = std::fs::canonicalize(dir.path()).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(FailingContentStore {
+        inner: Arc::new(InMemory::new()),
+    });
+    let fs = S3Fs::new(
+        store,
+        Config {
+            staging_dir: staging.join("staging"),
+            cache_dir: staging.join("read"),
+            read_cache_bytes: 0,
+            prefetch_bytes: 0,
+            flush_delay: Duration::from_millis(20),
+            ..Config::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let root = fs.root_dir();
+    let (ino, _) = fs.create(root, &name("f.txt"), sattr3::default()).await.unwrap();
+    fs.write(ino, 0, b"content").await.unwrap();
+
+    let report = fs.shutdown().await;
+    assert_eq!(report.uploaded, 0);
+    assert_eq!(report.failures.len(), 1, "the failed upload must be reported");
+    assert_eq!(report.failures[0].0, "f.txt");
+    assert!(report.failures[0].1.contains("refusing to write f.txt"));
+}

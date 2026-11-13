@@ -42,9 +42,9 @@ the only privileged step is the `mount_nfs` call itself, which the tool wraps in
 Prebuilt binary (Apple silicon, macOS 11+):
 
 ```console
-$ curl -LO https://github.com/yunhai-dev/mount-sso/releases/download/v0.1.2/mount-sso-0.1.2-aarch64-apple-darwin.tar.gz
-$ tar -xzf mount-sso-0.1.2-aarch64-apple-darwin.tar.gz
-$ sudo install mount-sso-0.1.2-aarch64-apple-darwin/mount-sso /usr/local/bin/
+$ curl -LO https://github.com/yunhai-dev/mount-sso/releases/download/v0.1.3/mount-sso-0.1.3-aarch64-apple-darwin.tar.gz
+$ tar -xzf mount-sso-0.1.3-aarch64-apple-darwin.tar.gz
+$ sudo install mount-sso-0.1.3-aarch64-apple-darwin/mount-sso /usr/local/bin/
 ```
 
 The release also publishes `SHA256SUMS`; verify with `shasum -a 256 -c SHA256SUMS`.
@@ -173,6 +173,31 @@ copy of the current object. The upload happens once the file has been untouched 
 Uploads up to 8 MiB are a single `PutObject`; larger files use multipart upload with 8 MiB
 parts and up to 8 parts in flight. `create` publishes an empty object immediately so the
 file is visible to other clients; the content follows with the flush.
+
+## When the mount is torn down
+
+`SIGINT`/`SIGTERM`/`SIGHUP`, `mount-sso umount` and a Finder eject all end the same way:
+every staged file is uploaded, the outcome is reported, and only then does the daemon exit.
+
+| Teardown | Order | What you see |
+| --- | --- | --- |
+| Ctrl-C / `SIGTERM` on the daemon | flush → report → unmount → exit | `sync complete: 3 files uploaded` (exit 0), or `sync incomplete: 1 file(s) not uploaded` with the reason (exit 1) |
+| `mount-sso umount <DIR>` | unmount → wait for the daemon → report its result | the same lines; the exit code mirrors the flush |
+| Finder eject, plain `umount` | unmount → the daemon flushes on its own and prints the result on its terminal | run `mount-sso umount <DIR>` afterwards to read the recorded outcome |
+
+The daemon writes `pid`, mount point and flush outcome to
+`~/Library/Caches/mount-sso/<hash>.state`, which is how `umount` — a separate process —
+knows to wait (up to ten minutes) and can then tell you whether the sync finished.
+
+Guaranteed: everything written before the teardown is either uploaded or reported as a
+failure with a non-zero exit code; a failed upload is never silent.
+
+Not guaranteed: `SIGKILL`, a crash or a power cut skip the flush. Writes staged inside the
+last `--flush-ms` are lost, and `umount` then reports `the daemon exited without reporting a
+flush result`. Lower `--flush-ms` to shrink that window.
+
+To check independently, compare the bucket listing with the tree (`mc ls -r`, `aws s3 ls`)
+or write a sentinel, unmount, and `cat` it back after remounting.
 
 ## Request cost
 

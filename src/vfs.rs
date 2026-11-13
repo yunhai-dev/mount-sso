@@ -267,6 +267,15 @@ impl Drop for StageHandle {
     }
 }
 
+/// Outcome of the final flush, reported by the daemon and consumed by `umount`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FlushReport {
+    /// Staged files that were uploaded.
+    pub uploaded: usize,
+    /// Files whose upload failed, with the reason.
+    pub failures: Vec<(String, String)>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Key prefix inside the bucket that becomes the mount root (no leading/trailing `/`).
@@ -869,7 +878,7 @@ impl Inner {
     }
 
     /// Upload the staged content of `stage` if it is dirty.
-    async fn flush_stage(&self, stage: Arc<Stage>) -> Result<()> {
+    async fn flush_stage(&self, stage: Arc<Stage>) -> Result<bool> {
         let local_only = {
             let state = self.state.lock().expect("state lock poisoned");
             state.local_only.contains(&stage.ino)
@@ -879,10 +888,10 @@ impl Inner {
             if local_only {
                 // AppleDouble scratch: dropped with the mount, never uploaded.
                 meta.dirty = false;
-                return Ok(());
+                return Ok(false);
             }
             if !meta.dirty || meta.uploading {
-                return Ok(());
+                return Ok(false);
             }
             meta.uploading = true;
             (stage.file.clone(), meta.len)
@@ -891,7 +900,7 @@ impl Inner {
             Ok(entry) => self.key(&entry.path),
             Err(_) => {
                 stage.meta.lock().expect("stage lock poisoned").uploading = false;
-                return Ok(());
+                return Ok(false);
             }
         };
         let result = self.upload(&key, &file, len).await;
@@ -913,19 +922,34 @@ impl Inner {
             }
             debug!("uploaded inode {} to {key} ({len} bytes)", stage.ino);
         }
-        result
+        result.map(|()| true)
     }
 
-    async fn flush_all(&self) {
+    async fn flush_all(&self) -> FlushReport {
         let stages: Vec<Arc<Stage>> = {
             let stages = self.stages.lock().expect("stages lock poisoned");
             stages.values().filter_map(|cell| cell.get().cloned()).collect()
         };
+        let mut report = FlushReport::default();
         for stage in stages {
-            if let Err(err) = self.flush_stage(stage.clone()).await {
-                warn!("flushing inode {} on shutdown failed: {err:#}", stage.ino);
+            let path = self
+                .state
+                .lock()
+                .expect("state lock poisoned")
+                .by_id
+                .get(&stage.ino)
+                .map(|entry| entry.path.clone())
+                .unwrap_or_else(|| format!("#{}", stage.ino));
+            match self.flush_stage(stage).await {
+                Ok(true) => report.uploaded += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    warn!("flushing {path} on shutdown failed: {err:#}");
+                    report.failures.push((path, format!("{err:#}")));
+                }
             }
         }
+        report
     }
 
     /// Periodically upload dirty stages and bound the staging directory size.
@@ -1032,9 +1056,12 @@ impl S3Fs {
         self.inner.cache.usage()
     }
 
-    /// Upload every pending write. Call before tearing the mount down.
-    pub async fn shutdown(&self) {
-        self.inner.flush_all().await;
+    /// Uploads every pending write and reports what happened.
+    ///
+    /// Call before tearing the mount down: the returned report is what the daemon publishes
+    /// so `umount` can tell the user whether the last flush was complete.
+    pub async fn shutdown(&self) -> FlushReport {
+        self.inner.flush_all().await
     }
 
     /// Create the only inode whose staging file may contain `data` without touching S3.
@@ -1595,7 +1622,10 @@ impl NFSFileSystem for S3Fs {
             if let Some(handle) = self.inner.acquire_stage(ino) {
                 let stage = handle.stage().clone();
                 drop(handle);
-                self.inner.flush_stage(stage).await.map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                self.inner
+                    .flush_stage(stage)
+                    .await
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
             }
             if let Ok((dst_ino, dst_entry)) = self.inner.resolve_rel(&to_rel).await {
                 let replaces_directory = dst_entry.kind == Kind::Dir;
@@ -1634,13 +1664,18 @@ impl NFSFileSystem for S3Fs {
             // Directory rename: S3 has no atomic prefix move, so copy then delete each key.
             let from_prefix = format!("{}/", self.inner.abs(&from_rel));
             let to_prefix = format!("{}/", self.inner.abs(&to_rel));
+            // Anything staged below the directory must land before the listing: a file that
+            // is still being written is only present in the bucket after its flush.
+            let report = self.inner.flush_all().await;
+            if !report.failures.is_empty() {
+                warn!("refusing to rename {from_rel}: {} staged file(s) failed to upload", report.failures.len());
+                return Err(nfsstat3::NFS3ERR_IO);
+            }
             let mut keys: Vec<ObjPath> = Vec::new();
             let mut stream = self.inner.store.list(Some(&obj_path(&from_prefix)));
             while let Some(item) = stream.next().await {
                 keys.push(item.map_err(nfs_err)?.location);
             }
-            // Anything staged below the directory must land before the copy.
-            self.inner.flush_all().await;
             for key in &keys {
                 let raw = key.to_string();
                 let Some(suffix) = raw.strip_prefix(&from_prefix) else {

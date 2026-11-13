@@ -4,6 +4,7 @@
 //! object-store client setup ([`backend`]) and the macOS mount plumbing ([`mount`]).
 
 pub mod backend;
+pub mod daemon;
 pub mod cache;
 pub mod mount;
 pub mod vfs;
